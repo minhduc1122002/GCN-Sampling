@@ -1,0 +1,6 @@
+# ignore data and keep sample data/enron
+*/mooc/
+*/uci/
+*/wikipedia/
+
+.DS_Store
