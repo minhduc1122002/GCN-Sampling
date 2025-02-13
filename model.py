@@ -259,20 +259,38 @@ class AdaptiveNodeSampler(nn.Module):
         return sampled_idx
 
 class LaplacianPositionalEncoding(nn.Module):
-    def __init__(self, pos_dim):
+    def __init__(self, pos_dim, eps=1e-5, normalized=True):
+        """
+        Args:
+            pos_dim (int): Number of eigenvectors to use.
+            eps (float): Stability constant.
+            normalized (bool): Use normalized Laplacian if True.
+        """
         super(LaplacianPositionalEncoding, self).__init__()
         self.pos_dim = pos_dim
+        self.eps = eps
+        self.normalized = normalized
 
     def forward(self, edge_index, num_nodes):
         device = edge_index.device
+        # Build dense adjacency matrix from edge_index.
         A = torch.zeros((num_nodes, num_nodes), device=device)
         for i, j in edge_index.t():
             A[i, j] = 1.0
-            A[j, i] = 1.0
-        deg = A.sum(dim=1)
-        D = torch.diag(deg)
-        L = D - A
-        eigvals, eigvecs = torch.linalg.eigh(L)
+            A[j, i] = 1.0  # assume undirected
+        if self.normalized:
+            deg = A.sum(dim=1)
+            D_inv_sqrt = torch.diag(1.0 / torch.sqrt(deg + self.eps))
+            L = torch.eye(num_nodes, device=device) - D_inv_sqrt @ A @ D_inv_sqrt
+        else:
+            deg = A.sum(dim=1)
+            D = torch.diag(deg)
+            L = D - A + self.eps * torch.eye(num_nodes, device=device)
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(L)
+        except Exception as e:
+            print("Eigen decomposition failed:", e)
+            eigvecs = torch.zeros((num_nodes, num_nodes), device=device)
         return eigvecs[:, :self.pos_dim]
 
 class TemporalEncoder(nn.Module):
