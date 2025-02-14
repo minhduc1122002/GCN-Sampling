@@ -46,14 +46,14 @@ def build_adjacency(sources, destinations, num_nodes):
         A[v, u] = 1
     return torch.tensor(A, dtype=torch.float)
 
-def evaluate_edges(model, sources, destinations, timestamps, num_nodes, device):
+def evaluate_model(model, sources, destinations, timestamps, num_nodes, device):
     model.eval()
     node_ids = torch.arange(num_nodes, device=device)
     edge_index = torch.tensor([sources, destinations], dtype=torch.long).to(device)
     A = build_adjacency(sources, destinations, num_nodes).to(device)
     ts = torch.tensor(timestamps, dtype=torch.float).to(device)
     with torch.no_grad():
-        embeddings = model(node_ids, edge_index, A, ts)
+        _, embeddings = model(node_ids, edge_index, A, ts)
     pos_edges = np.array(list(zip(sources, destinations)))
     pos_u = pos_edges[:, 0]
     pos_v = pos_edges[:, 1]
@@ -110,12 +110,15 @@ def train_link_prediction(args):
                     num_super_nodes=args.num_super_nodes,
                     num_global_nodes=args.num_global_nodes,
                     coarsen_method=args.coarsen_method,
-                    threshold=args.threshold).to(device)
+                    threshold=args.threshold,
+                    gamma=args.gamma).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.BCEWithLogitsLoss()
     num_epochs = args.num_epochs
 
+    cnt = 0
+    prev_auc = 0.0
     model.train()
     for epoch in range(num_epochs):
         optimizer.zero_grad()
@@ -123,7 +126,7 @@ def train_link_prediction(args):
         ts_train = torch.tensor(train_timestamps, dtype=torch.float).to(device)
         full_edge_index_train = torch.tensor([train_sources, train_destinations], dtype=torch.long).to(device)
         # Compute full node embeddings once per epoch.
-        embeddings = model(node_ids, full_edge_index_train, A_train, ts_train)
+        _, embeddings = model(node_ids, full_edge_index_train, A_train, ts_train)
         epoch_loss = 0.0
         # Accumulate loss over mini-batches.
         for batch in train_edge_loader:
@@ -148,11 +151,29 @@ def train_link_prediction(args):
         epoch_loss.backward()
         optimizer.step()
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss.item()/len(train_edge_loader):.4f}")
+        # Evaluate model on validation set.
+        val_sources = np.array(val_data.sources)
+        val_destinations = np.array(val_data.destinations)
+        val_timestamps = np.array(val_data.timestamps)
+        auc, ap = evaluate_model(model, val_sources, val_destinations, val_timestamps, num_nodes, device)
+        print(f"Validation AUC: {auc*100:.4f}%, Validation AP: {ap*100:.4f}%")
+        # Early stopping based on validation AUC.
+        if auc > prev_auc:
+            cnt = 0
+            prev_auc = auc
+            torch.save(model.state_dict(), "link_pred_model.pth")
+        else:
+            cnt += 1
+            if cnt == 5:
+                print("Early stopping.")
+                break
     
-    torch.save(model.state_dict(), "link_pred_model.pth")
+    # torch.save(model.state_dict(), "link_pred_model.pth")
     print("Training complete. Model saved as 'link_pred_model.pth'.")
     
     # Evaluate on test split.
+    # load the best model
+    model.load_state_dict(torch.load("link_pred_model.pth"))
     test_sources = np.array(test_data.sources)
     test_destinations = np.array(test_data.destinations)
     test_timestamps = np.array(test_data.timestamps)
@@ -160,7 +181,7 @@ def train_link_prediction(args):
     full_edge_index_test = torch.tensor([test_sources, test_destinations], dtype=torch.long).to(device)
     model.eval()
     with torch.no_grad():
-        embeddings = model(torch.arange(num_nodes, device=device), full_edge_index_test, A_full, ts_test)
+        _, embeddings = model(torch.arange(num_nodes, device=device), full_edge_index_test, A_full, ts_test)
     emb = embeddings
     pos_edges_test = np.array(list(zip(test_sources, test_destinations)))
     num_pos_test = len(pos_edges_test)
@@ -175,7 +196,7 @@ def train_link_prediction(args):
     all_labels = np.concatenate([np.ones(num_pos_test), np.zeros(num_pos_test)])
     auc = roc_auc_score(all_labels, all_scores)
     ap = average_precision_score(all_labels, all_scores)
-    print(f"Test AUC: {auc*100:.2f}%, Test AP: {ap*100:.2f}%")
+    print(f"Test AUC: {auc*100:.4f}%, Test AP: {ap*100:.4f}%")
 
 def main():
     parser = argparse.ArgumentParser(description="Train Link Prediction Model using ASH-DGT with mini-batch training")
@@ -189,8 +210,8 @@ def main():
     parser.add_argument("--attn_heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--num_transformer_layers", type=int, default=3, help="Number of transformer layers")
     parser.add_argument("--num_global_nodes", type=int, default=2, help="Number of global nodes")
-    parser.add_argument("--num_super_nodes", type=int, default=6, help="Number of super nodes for coarsening")
-    parser.add_argument("--num_sampled_neighbors", type=int, default=15, help="Number of sampled neighbors")
+    parser.add_argument("--num_super_nodes", type=int, default=12, help="Number of super nodes for coarsening")
+    parser.add_argument("--num_sampled_neighbors", type=int, default=5, help="Number of sampled neighbors")
     parser.add_argument("--coarsen_method", type=str, default="kmeans", choices=["kmeans", "ve", "vn", "jc"],
                         help="Coarsening method")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for coarsening methods")
@@ -202,6 +223,7 @@ def main():
     parser.add_argument("--pos_dim", type=int, default=8, help="Positional encoding dimension")
     parser.add_argument("--time_dim", type=int, default=8, help="Temporal encoding dimension")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for mini-batch training")
+    parser.add_argument("--gamma", type=float, default=0.5, help="Gamma for bandit sampling")
     args = parser.parse_args()
     
     random.seed(args.seed)

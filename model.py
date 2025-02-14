@@ -1,65 +1,96 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.cluster import KMeans
 import numpy as np
+from sklearn.cluster import KMeans
 
 ###############################################
 # Graph Coarsening Functions
 ###############################################
+def get_one_hop_neighbors(A, node_idx, max_neighbors=50):
+    # A: [num_nodes, num_nodes] dense adjacency matrix.
+    neighbors = (A[node_idx] > 0).nonzero(as_tuple=False).squeeze()
+    if neighbors.dim() == 0:
+        neighbors = neighbors.unsqueeze(0)
+    # Exclude self.
+    neighbors = neighbors[neighbors != node_idx]
+    if neighbors.numel() == 0:
+        return None
+    if neighbors.numel() > max_neighbors:
+        perm = torch.randperm(neighbors.numel(), device=A.device)[:max_neighbors]
+        neighbors = neighbors[perm]
+    return neighbors
 
 def graph_coarsening_kmeans(X, A, num_super_nodes, threshold=0.0):
     """
     Coarsening using K-Means clustering on node features.
-    The 'threshold' parameter is accepted but not used by default.
+    If X contains NaN values, we skip KMeans and return X and an identity matrix.
     """
     n = X.size(0)
     if num_super_nodes <= 0:
         P = torch.eye(n, device=X.device)
         return X, A, P
-    X_np = X.cpu().detach().numpy()
+    # Replace NaNs with 0.
+    X_np = torch.nan_to_num(X, nan=0.0).cpu().detach().numpy()
+    # If there are still any NaN (shouldn't be), then skip clustering.
+    if np.isnan(X_np).any():
+        print("Warning: NaN detected in features. Skipping KMeans coarsening.")
+        P = torch.eye(n, device=X.device)
+        return X, A, P
+    # Otherwise, do KMeans.
     kmeans = KMeans(n_clusters=num_super_nodes, random_state=0).fit(X_np)
     labels = kmeans.labels_
     P_prime = torch.zeros(n, num_super_nodes, device=X.device)
     for i, label in enumerate(labels):
         P_prime[i, label] = 1.0
-    # (Optional: one could check cluster inertia here and filter clusters based on threshold)
     cluster_sizes = P_prime.sum(dim=0)
     D_inv_sqrt = torch.diag(1.0 / torch.sqrt(cluster_sizes + 1e-10))
     P = P_prime @ D_inv_sqrt
     X_coarse = P.t() @ X
     A_coarse = P.t() @ A @ P
     return X_coarse, A_coarse, P
-
+    
 def graph_coarsening_ve(X, A, num_super_nodes, threshold=0.5):
     """
-    Coarsening using Variation-Edge (VE) based method.
-    Nodes are merged based on the similarity of their normalized edge weights.
-    Only candidate pairs with similarity >= threshold are considered.
+    Variation-Edge (VE) Coarsening:
     """
     n = X.size(0)
     if num_super_nodes >= n:
         P = torch.eye(n, device=X.device)
         return X, A, P
 
-    degrees = A.sum(dim=1)
-    norm_weights = A / (degrees.unsqueeze(1) + 1e-10)
-    candidate_pairs = []
-    for i in range(n):
-        for j in range(i+1, n):
-            sim = -torch.norm(norm_weights[i] - norm_weights[j], p=1).item()
-            if sim < threshold:
-                continue
-            candidate_pairs.append((sim, i, j))
-    candidate_pairs.sort(reverse=True, key=lambda x: x[0])
+    # Compute normalized edge weight matrix (each row sums to 1)
+    deg = A.sum(dim=1)  # [n]
+    norm_weights = A / (deg.unsqueeze(1) + 1e-10)  # [n, n]
+
+    # Compute pairwise L1 distances in a vectorized way.
+    dist_matrix = torch.cdist(norm_weights, norm_weights, p=1)  # [n, n]
+    sim_matrix = -dist_matrix  # similarity = negative L1 distance
+
+    # Extract upper-triangular indices (move them to the same device as X)
+    triu_idx = torch.triu_indices(n, n, offset=1).to(X.device)
+    sim_values = sim_matrix[triu_idx[0], triu_idx[1]]
     
+    # Filter candidate pairs with similarity above threshold.
+    valid_mask = sim_values >= threshold
+    valid_idx = triu_idx[:, valid_mask]
+    valid_sim = sim_values[valid_mask].tolist()
+
+    candidate_pairs = []
+    for k in range(valid_idx.size(1)):
+        i = valid_idx[0, k].item()
+        j = valid_idx[1, k].item()
+        candidate_pairs.append((valid_sim[k], i, j))
+    candidate_pairs.sort(reverse=True, key=lambda x: x[0])
+
+    # Union-find merging.
     parent = list(range(n))
     def find(i):
         while parent[i] != i:
             parent[i] = parent[parent[i]]
             i = parent[i]
         return i
-    
+
     merged = 0
     for sim, i, j in candidate_pairs:
         pi = find(i)
@@ -89,37 +120,43 @@ def graph_coarsening_ve(X, A, num_super_nodes, threshold=0.5):
 
 def graph_coarsening_vn(X, A, num_super_nodes, threshold=0.5):
     """
-    Coarsening using Variation-Neighborhood (VN) based method.
-    Groups nodes with high Jaccard similarity of their neighborhoods.
+    Variation-Neighborhood (VN) Coarsening:
     """
     n = X.size(0)
     if num_super_nodes >= n:
-        P = torch.eye(n, device=X.device)
+        P = torch.eye(n, device=A.device)
         return X, A, P
 
-    A_bin = (A > 0).float()
+    A_bin = (A > 0).float()  # [n, n]
+    row_sum = A_bin.sum(dim=1)  # [n]
+
+    # Compute pairwise intersection and union using broadcasting.
+    inter = (A_bin.unsqueeze(1) * A_bin.unsqueeze(0)).sum(dim=2)  # [n, n]
+    union = row_sum.unsqueeze(1) + row_sum.unsqueeze(0) - inter  # [n, n]
+    union[union == 0] = 1e-10  # avoid division by zero
+    jaccard_matrix = inter / union  # [n, n]
+
+    # Extract upper-triangular indices (move to same device).
+    triu_idx = torch.triu_indices(n, n, offset=1).to(X.device)
+    sim_values = jaccard_matrix[triu_idx[0], triu_idx[1]]
+    valid_mask = sim_values >= threshold
+    valid_idx = triu_idx[:, valid_mask]
+    valid_sim = sim_values[valid_mask].tolist()
+
+    candidate_pairs = []
+    for k in range(valid_idx.size(1)):
+        i = valid_idx[0, k].item()
+        j = valid_idx[1, k].item()
+        candidate_pairs.append((valid_sim[k], i, j))
+    candidate_pairs.sort(reverse=True, key=lambda x: x[0])
+    
     parent = list(range(n))
     def find(i):
         while parent[i] != i:
             parent[i] = parent[parent[i]]
             i = parent[i]
         return i
-    def jaccard(i, j):
-        Ni = A_bin[i]
-        Nj = A_bin[j]
-        inter = (Ni * Nj).sum().item()
-        union = (Ni + Nj - Ni * Nj).sum().item()
-        return inter / union if union > 0 else 0.0
 
-    candidate_pairs = []
-    for i in range(n):
-        for j in range(i+1, n):
-            sim = jaccard(i, j)
-            if sim < threshold:
-                continue
-            candidate_pairs.append((sim, i, j))
-    candidate_pairs.sort(reverse=True, key=lambda x: x[0])
-    
     merged = 0
     for sim, i, j in candidate_pairs:
         pi = find(i)
@@ -130,7 +167,7 @@ def graph_coarsening_vn(X, A, num_super_nodes, threshold=0.5):
             if n - merged <= num_super_nodes:
                 break
 
-    P_prime = torch.zeros(n, n - merged, device=X.device)
+    P_prime = torch.zeros(n, n - merged, device=A.device)
     mapping = {}
     new_label = 0
     for i in range(n):
@@ -147,11 +184,8 @@ def graph_coarsening_vn(X, A, num_super_nodes, threshold=0.5):
     A_coarse = P.t() @ A @ P
     return X_coarse, A_coarse, P
 
+
 def graph_coarsening_jc(X, A, num_super_nodes, threshold=0.5):
-    """
-    Coarsening using the Jaccard Coefficient (JC) method.
-    Groups nodes whose neighborhoods have high Jaccard similarity.
-    """
     n = X.size(0)
     if num_super_nodes >= n:
         P = torch.eye(n, device=X.device)
@@ -189,7 +223,6 @@ def graph_coarsening_jc(X, A, num_super_nodes, threshold=0.5):
             merged += 1
             if n - merged <= num_super_nodes:
                 break
-
     P_prime = torch.zeros(n, n - merged, device=X.device)
     mapping = {}
     new_label = 0
@@ -199,7 +232,6 @@ def graph_coarsening_jc(X, A, num_super_nodes, threshold=0.5):
             mapping[pi] = new_label
             new_label += 1
         P_prime[i, mapping[pi]] = 1.0
-
     cluster_sizes = P_prime.sum(dim=0)
     D_inv_sqrt = torch.diag(1.0 / torch.sqrt(cluster_sizes + 1e-10))
     P = P_prime @ D_inv_sqrt
@@ -208,11 +240,6 @@ def graph_coarsening_jc(X, A, num_super_nodes, threshold=0.5):
     return X_coarse, A_coarse, P
 
 def graph_coarsening(X, A, num_super_nodes, method="kmeans", threshold=0.5):
-    """
-    Unified graph coarsening function.
-    method: 'kmeans', 've', 'vn', or 'jc'
-    The threshold parameter is applied in VE, VN, and JC methods.
-    """
     if method == "kmeans":
         return graph_coarsening_kmeans(X, A, num_super_nodes, threshold)
     elif method == "ve":
@@ -225,47 +252,10 @@ def graph_coarsening(X, A, num_super_nodes, method="kmeans", threshold=0.5):
         raise ValueError("Unknown coarsening method: choose from 'kmeans', 've', 'vn', or 'jc'.")
 
 ###############################################
-# (The rest of your model code remains unchanged)
+# Laplacian Positional Encoding
 ###############################################
-# Example: AdaptiveNodeSampler, LaplacianPositionalEncoding, TemporalEncoder, and ASH_DGT are defined below.
-# For brevity, here is a minimal stub for the ASH_DGT model that uses the graph coarsening function.
-
-class AdaptiveNodeSampler(nn.Module):
-    def __init__(self, embed_dim, num_neighbors, gamma=0.1):
-        super(AdaptiveNodeSampler, self).__init__()
-        self.num_neighbors = num_neighbors
-        self.gamma = gamma
-        self.query_proj = nn.Linear(embed_dim, embed_dim)
-        self.key_proj = nn.Linear(embed_dim, embed_dim)
-        self.scale = embed_dim ** 0.5
-        self.cached_scores = None
-
-    def cache_attention_scores(self, attn_scores):
-        self.cached_scores = attn_scores
-
-    def forward(self, target_embed, candidate_embeds):
-        B, N, _ = candidate_embeds.size()
-        if self.cached_scores is not None:
-            p = self.cached_scores
-        else:
-            Q = self.query_proj(target_embed)
-            K = self.key_proj(candidate_embeds)
-            scores = torch.einsum('bd,bnd->bn', Q, K) / self.scale
-            p = torch.softmax(scores, dim=-1)
-        uniform = torch.full_like(p, self.gamma / N)
-        p = (1 - self.gamma) * p + uniform
-        sampled_idx = torch.multinomial(p, self.num_neighbors, replacement=False)
-        self.cached_scores = None
-        return sampled_idx
-
 class LaplacianPositionalEncoding(nn.Module):
     def __init__(self, pos_dim, eps=1e-5, normalized=True):
-        """
-        Args:
-            pos_dim (int): Number of eigenvectors to use.
-            eps (float): Stability constant.
-            normalized (bool): Use normalized Laplacian if True.
-        """
         super(LaplacianPositionalEncoding, self).__init__()
         self.pos_dim = pos_dim
         self.eps = eps
@@ -273,11 +263,10 @@ class LaplacianPositionalEncoding(nn.Module):
 
     def forward(self, edge_index, num_nodes):
         device = edge_index.device
-        # Build dense adjacency matrix from edge_index.
         A = torch.zeros((num_nodes, num_nodes), device=device)
         for i, j in edge_index.t():
             A[i, j] = 1.0
-            A[j, i] = 1.0  # assume undirected
+            A[j, i] = 1.0
         if self.normalized:
             deg = A.sum(dim=1)
             D_inv_sqrt = torch.diag(1.0 / torch.sqrt(deg + self.eps))
@@ -293,6 +282,9 @@ class LaplacianPositionalEncoding(nn.Module):
             eigvecs = torch.zeros((num_nodes, num_nodes), device=device)
         return eigvecs[:, :self.pos_dim]
 
+###############################################
+# Temporal Encoder
+###############################################
 class TemporalEncoder(nn.Module):
     def __init__(self, time_dim):
         super(TemporalEncoder, self).__init__()
@@ -304,6 +296,41 @@ class TemporalEncoder(nn.Module):
             t = t.unsqueeze(-1)
         return torch.cos(self.linear(t.float()))
 
+###############################################
+# AdaptiveSampler: Returns sampled neighbor indices using EXP3-style sampling.
+###############################################
+class AdaptiveSampler(nn.Module):
+    def __init__(self, embed_dim, num_neighbors, gamma=0.1):
+        super(AdaptiveSampler, self).__init__()
+        self.num_neighbors = num_neighbors
+        self.gamma = gamma
+        self.query_proj = nn.Linear(embed_dim, embed_dim)
+        self.key_proj = nn.Linear(embed_dim, embed_dim)
+        self.scale = embed_dim ** 0.5
+
+    def forward(self, target_embed, candidate_embeds):
+        # Check if target_embed is empty
+        if target_embed.numel() == 0:
+            return torch.empty(0, self.num_neighbors, device=target_embed.device, dtype=torch.long)
+        # Ensure target_embed is 2D: [B, D]
+        if target_embed.dim() > 2:
+            target_embed = target_embed.view(target_embed.size(0), -1)
+        # target_embed: [B, D]; candidate_embeds: [B, N, D]
+        Q = self.query_proj(target_embed)      # [B, D]
+        K = self.key_proj(candidate_embeds)      # [B, N, D]
+        scores = torch.einsum('bd,bnd->bn', Q, K) / self.scale  # [B, N]
+        probs = torch.softmax(scores, dim=-1)
+        uniform = torch.full_like(probs, self.gamma / candidate_embeds.size(1))
+        probs = (1 - self.gamma) * probs + uniform
+        sampled_idx = torch.multinomial(probs, self.num_neighbors, replacement=False)
+        return sampled_idx
+
+
+
+
+###############################################
+# ASH-DGT Model for Link Prediction
+###############################################
 class ASH_DGT(nn.Module):
     def __init__(self,
                  num_nodes,
@@ -319,7 +346,8 @@ class ASH_DGT(nn.Module):
                  num_super_nodes=6,
                  num_global_nodes=2,
                  coarsen_method="kmeans",
-                 threshold=0.5):
+                 threshold=0.5,
+                 gamma=0.4):
         super(ASH_DGT, self).__init__()
         self.num_nodes = num_nodes
         self.hidden_dim = hidden_dim
@@ -327,12 +355,12 @@ class ASH_DGT(nn.Module):
         self.num_global_nodes = num_global_nodes
         self.coarsen_method = coarsen_method
         self.threshold = threshold
-
+        
         self.node_embedding = nn.Embedding(num_nodes, in_dim)
         self.pos_encoder = LaplacianPositionalEncoding(pos_dim)
         self.temp_encoder = TemporalEncoder(time_dim)
         self.input_proj = nn.Linear(in_dim + pos_dim + time_dim, hidden_dim)
-        self.adaptive_sampler = AdaptiveNodeSampler(embed_dim=hidden_dim, num_neighbors=num_neighbors)
+        
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
         self.classifier = nn.Sequential(
@@ -340,44 +368,113 @@ class ASH_DGT(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, num_classes)
         )
-
+        
+        self.adaptive_sampler = AdaptiveSampler(embed_dim=hidden_dim, num_neighbors=num_neighbors, gamma=gamma)
+        
+        # Edge transformer to process edge sequences.
+        edge_encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dropout=dropout)
+        self.edge_transformer = nn.TransformerEncoder(edge_encoder_layer, num_layers=1)
+    
     def forward(self, node_ids, edge_index, A, edge_times):
         device = node_ids.device
-        n = self.num_nodes
-        x = self.node_embedding(node_ids)
-        pos_enc = self.pos_encoder(edge_index, n)
+        # n = self.num_nodes
+        n = node_ids.size(0)
+        
+        # Compute initial node embeddings.
+        x = self.node_embedding(node_ids)                # [n, in_dim]
+        pos_enc = self.pos_encoder(edge_index, n)          # [n, pos_dim]
         avg_time = torch.full((n, 1), edge_times.mean().item(), device=device)
-        temp_enc = self.temp_encoder(avg_time)
-        x_cat = torch.cat([x, pos_enc, temp_enc], dim=-1)
-        x_hidden = self.input_proj(x_cat)
+        temp_enc = self.temp_encoder(avg_time)             # [n, time_dim]
+        x_cat = torch.cat([x, pos_enc, temp_enc], dim=1)     # [n, in_dim+pos_dim+time_dim]
+        h = self.input_proj(x_cat)                         # [n, hidden_dim]
         
-        # Adaptive node sampling (for demonstration, we simulate candidate neighbor sampling).
-        B = n
-        N_candidates = 50
-        candidate_indices = torch.randint(0, n, (B, N_candidates), device=device)
-        candidate_embeds = x_hidden[candidate_indices]
-        sampled_idx = self.adaptive_sampler(x_hidden, candidate_embeds)
-        sampled_neighbors = torch.gather(candidate_embeds, 1,
-                                         sampled_idx.unsqueeze(-1).expand(-1, -1, self.hidden_dim))
-        transformer_input = torch.cat([x_hidden.unsqueeze(1), sampled_neighbors], dim=1)
+        # Transformer encoding over all nodes.
+        h_seq = h.unsqueeze(0)                             # [1, n, hidden_dim]
+        h_trans = self.transformer_encoder(h_seq)
+        h = h_trans.squeeze(0)                             # [n, hidden_dim]
         
-        # Graph coarsening and global node generation.
+        # Precompute aggregated super and global features.
         if self.num_super_nodes > 0:
-            X_coarse, A_coarse, _ = graph_coarsening(x_hidden, A, self.num_super_nodes,
+            X_coarse, A_coarse, _ = graph_coarsening(h, A, self.num_super_nodes,
                                                      method=self.coarsen_method,
                                                      threshold=self.threshold)
-            # For simplicity, global nodes are generated using kmeans on X_coarse.
-            X_np = X_coarse.cpu().detach().numpy()
-            kmeans = KMeans(n_clusters=self.num_global_nodes, random_state=0).fit(X_np)
-            centroids = torch.tensor(kmeans.cluster_centers_, device=x_hidden.device, dtype=x_hidden.dtype)
-            global_nodes = centroids
+            super_nodes = X_coarse                        # [num_super_nodes, hidden_dim]
+            agg_super = super_nodes.mean(dim=0, keepdim=True)  # [1, hidden_dim]
         else:
-            global_nodes = x_hidden.mean(dim=0, keepdim=True)
-        global_nodes_exp = global_nodes.unsqueeze(0).expand(B, -1, -1)
-        transformer_input = torch.cat([transformer_input, global_nodes_exp], dim=1)
+            agg_super = h.mean(dim=0, keepdim=True)
+        agg_global = h.mean(dim=0, keepdim=True)            # [1, hidden_dim]
         
-        transformer_input = transformer_input.transpose(0, 1)
-        transformer_output = self.transformer_encoder(transformer_input)
-        final_representation = transformer_output[0]
-        logits = self.classifier(final_representation)
-        return logits
+        # Vectorized neighbor retrieval:
+        E = edge_index.size(1)
+        max_nbr = 50
+        # Precompute one-hop neighbors for all nodes.
+        neighbors_list = []
+        for i in range(n):
+            nbrs = get_one_hop_neighbors(A, i, max_neighbors=max_nbr)
+            if nbrs is None or nbrs.numel() == 0:
+                padded = torch.full((max_nbr,), i, device=device, dtype=torch.long)
+            else:
+                pad_len = max_nbr - nbrs.numel()
+                if pad_len > 0:
+                    padded = torch.cat([nbrs, torch.full((pad_len,), i, device=device, dtype=torch.long)])
+                else:
+                    padded = nbrs[:max_nbr]
+            neighbors_list.append(padded)
+        neighbors_tensor = torch.stack(neighbors_list, dim=0)  # [n, max_nbr]
+        
+        # For each edge, get candidate neighbor indices for u and v.
+        u_idx = edge_index[0]   # [E]
+        v_idx = edge_index[1]   # [E]
+        cand_u = neighbors_tensor[u_idx]  # [E, max_nbr]
+        cand_v = neighbors_tensor[v_idx]  # [E, max_nbr]
+        candidates_u = h[cand_u]  # [E, max_nbr, hidden_dim]
+        candidates_v = h[cand_v]  # [E, max_nbr, hidden_dim]
+        target_u = h[u_idx].unsqueeze(1)  # [E, 1, hidden_dim]
+        target_v = h[v_idx].unsqueeze(1)  # [E, 1, hidden_dim]
+        
+        # Use AdaptiveSampler in batch.
+        sampled_idx_u = self.adaptive_sampler(target_u, candidates_u)  # [E, num_neighbors]
+        sampled_idx_v = self.adaptive_sampler(target_v, candidates_v)  # [E, num_neighbors]
+        
+        E_range = torch.arange(E, device=device).unsqueeze(1)  # [E, 1]
+        sampled_neighbors_u = candidates_u[E_range, sampled_idx_u]  # [E, num_neighbors, hidden_dim]
+        sampled_neighbors_v = candidates_v[E_range, sampled_idx_v]  # [E, num_neighbors, hidden_dim]
+        agg_u = sampled_neighbors_u.mean(dim=1)  # [E, hidden_dim]
+        agg_v = sampled_neighbors_v.mean(dim=1)  # [E, hidden_dim]
+        
+        # Build edge sequence for each edge: 
+        # [h[u], agg_u, agg_v, h[v], agg_super, agg_global]
+        seq_u = h[u_idx]        # [E, hidden_dim]
+        seq_v = h[v_idx]        # [E, hidden_dim]
+        agg_super_exp = agg_super.expand(E, -1)  # [E, hidden_dim]
+        agg_global_exp = agg_global.expand(E, -1)  # [E, hidden_dim]
+        edge_seq = torch.stack([seq_u, agg_u, agg_v, seq_v, agg_super_exp, agg_global_exp], dim=1)  # [E, 6, hidden_dim]
+        edge_seq = edge_seq.transpose(0, 1)  # [6, E, hidden_dim]
+        
+        # Process edge sequences in chunks to avoid CUDA configuration errors.
+        chunk_size = 1024  # adjust as needed
+        E_total = edge_seq.size(1)
+        edge_seq_trans_list = []
+        for i in range(0, E_total, chunk_size):
+            chunk = edge_seq[:, i:i+chunk_size, :]  # [6, chunk, hidden_dim]
+            chunk_trans = self.edge_transformer(chunk)  # [6, chunk, hidden_dim]
+            edge_seq_trans_list.append(chunk_trans)
+        updated_h = h.clone()
+        if len(edge_seq_trans_list) == 0:
+            # If no chunks were produced, bypass edge transformer.
+            edge_seq_trans = None
+            updated_u = None
+            updated_v = None
+        else:
+          edge_seq_trans = torch.cat(edge_seq_trans_list, dim=1)  # [6, E, hidden_dim]
+          
+          # Take tokens at positions 0 and 3 as updated embeddings for u and v.
+          updated_u = edge_seq_trans[0]  # [E, hidden_dim]
+          updated_v = edge_seq_trans[3]  # [E, hidden_dim]
+          
+          # Update node embeddings: here we update nodes that appear in edge_index.
+          updated_h.index_copy_(0, u_idx, updated_u)
+          updated_h.index_copy_(0, v_idx, updated_v)
+        
+        logits = self.classifier(updated_h)
+        return logits, updated_h

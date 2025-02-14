@@ -38,6 +38,71 @@ def get_data_node_classification(dataset_name, use_validation=False):
                      edge_idxs[test_mask], labels[test_mask])
     return full_data, node_features, edge_features, train_data, val_data, test_data
 
+def get_data_node_classification_inductive(dataset_name, use_validation=False, val_ratio=0.15, test_ratio=0.15):
+    # Load CSV file.
+    graph_df = pd.read_csv(f"./data/{dataset_name}/ml_{dataset_name}.csv")
+    graph_df.sort_values(by="ts", inplace=True)
+
+    # Load additional data if needed.
+    edge_features = np.load(f"./data/{dataset_name}/ml_{dataset_name}.npy")
+    node_features = np.load(f"./data/{dataset_name}/ml_{dataset_name}_node.npy")
+    
+    # Compute time thresholds.
+    train_threshold, test_threshold = np.quantile(graph_df.ts, [1 - val_ratio - test_ratio, 1 - test_ratio])
+    
+    # Create masks for edge splits.
+    train_mask = graph_df.ts <= train_threshold
+    if use_validation:
+        val_mask = (graph_df.ts > train_threshold) & (graph_df.ts <= test_threshold)
+    else:
+        val_mask = np.zeros_like(graph_df.ts, dtype=bool)
+    test_mask = graph_df.ts > test_threshold
+
+    # Create Data objects.
+    full_data = Data(graph_df.u.values, graph_df.i.values, graph_df.ts.values,
+                     graph_df.idx.values, graph_df.label.values)
+    train_data = Data(graph_df.u.values[train_mask],
+                      graph_df.i.values[train_mask],
+                      graph_df.ts.values[train_mask],
+                      graph_df.idx.values[train_mask],
+                      graph_df.label.values[train_mask])
+    val_data = Data(graph_df.u.values[val_mask],
+                    graph_df.i.values[val_mask],
+                    graph_df.ts.values[val_mask],
+                    graph_df.idx.values[val_mask],
+                    graph_df.label.values[val_mask])
+    test_data = Data(graph_df.u.values[test_mask],
+                     graph_df.i.values[test_mask],
+                     graph_df.ts.values[test_mask],
+                     graph_df.idx.values[test_mask],
+                     graph_df.label.values[test_mask])
+    
+    # Determine training nodes.
+    train_nodes = set(train_data.sources).union(set(train_data.destinations))
+    
+    # Build boolean masks for validation and test edges that involve at least one new node.
+    val_sources = np.array(val_data.sources)
+    val_destinations = np.array(val_data.destinations)
+    new_val_mask = np.array([ (u not in train_nodes or v not in train_nodes) for u, v in zip(val_sources, val_destinations) ], dtype=bool)
+    
+    test_sources = np.array(test_data.sources)
+    test_destinations = np.array(test_data.destinations)
+    new_test_mask = np.array([ (u not in train_nodes or v not in train_nodes) for u, v in zip(test_sources, test_destinations) ], dtype=bool)
+    
+    new_val_data = Data(val_data.sources[new_val_mask],
+                        val_data.destinations[new_val_mask],
+                        val_data.timestamps[new_val_mask],
+                        val_data.edge_idxs[new_val_mask],
+                        val_data.labels[new_val_mask])
+    new_test_data = Data(test_data.sources[new_test_mask],
+                         test_data.destinations[new_test_mask],
+                         test_data.timestamps[new_test_mask],
+                         test_data.edge_idxs[new_test_mask],
+                         test_data.labels[new_test_mask])
+    
+    return node_features, edge_features, full_data, train_data, val_data, test_data, new_val_data, new_test_data
+
+
 def get_data(dataset_name, val_ratio, test_ratio, different_new_nodes_between_val_and_test=False,
              randomize_features=False):
     # This function is used for link prediction.
@@ -65,7 +130,7 @@ def get_data(dataset_name, val_ratio, test_ratio, different_new_nodes_between_va
     node_set = set(sources) | set(destinations)
     n_total_unique_nodes = len(node_set)
     test_node_set = set(sources[timestamps > val_time]).union(set(destinations[timestamps > val_time]))
-
+    test_node_set = sorted(test_node_set)
     new_test_node_set = set(random.sample(test_node_set, int(0.1 * n_total_unique_nodes)))
     new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
     new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
