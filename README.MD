@@ -15,17 +15,12 @@ You can find all dataset are used in this [link](https://zenodo.org/records/7213
 
 ## Training and experiments
 Feel free to explore and fine-tuning the model hyperparamters (see description in the main) and custom to search them in your own setting script (eg. bash script).
-### Node classification
-```python 
-python train_node_classification_v2.py --dataset_name mooc --epochs 50 --lr 0.001 --in_dim 16 --hidden_dim 16 --pos_dim 8 --time_dim 8 --batch_size 128
-```
 
 ### Link prediction
 ```python
-python train_link_prediction_v2.py --dataset_name uci --num_epochs 50 --attn_heads 8 --lr 0.001 --dropout 0.1 --hidden_dim 16 --embedding_dim 16 --coarsen_method ve --seed 1024
+python train_link_prediction_v2.py --dataset_name $DATASET --num_epochs 50 --lr 0.001 --dropout 0.1 --hidden_dim 64 --embedding_dim 64 --num_sampled_neighbors 20
 ```
 
-Will update the readme soon!
 
 
 
