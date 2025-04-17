@@ -358,6 +358,7 @@ class ASH_DGT(nn.Module):
         pos_dim=8,
         time_dim=8,
         num_neighbors=15,
+        backbone='Transformer',
         num_transformer_layers=3,
         nhead=8,
         dropout=0.2,
@@ -374,13 +375,25 @@ class ASH_DGT(nn.Module):
         self.num_global_nodes = num_global_nodes
         self.coarsen_method = coarsen_method
         self.threshold = threshold
+        self.backbone = backbone
 
         self.node_embedding = nn.Embedding(num_nodes, in_dim)
         self.pos_encoder = LaplacianPositionalEncoding(pos_dim)
         self.temp_encoder = TemporalEncoder(time_dim)
         self.input_proj = nn.Linear(in_dim + pos_dim + time_dim, hidden_dim)
 
-        self.gcn = GCNConv(hidden_dim, hidden_dim)
+        if self.backbone != 'Transformer':
+            self.encoder = GCNConv(hidden_dim, hidden_dim)
+            self.edge_conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=nhead, dropout=dropout
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers=num_transformer_layers
+            )
+            self.edge_conv = nn.MultiheadAttention(hidden_dim, nhead)
+            
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -390,7 +403,6 @@ class ASH_DGT(nn.Module):
         self.adaptive_sampler = AdaptiveSampler(
             embed_dim=hidden_dim, num_neighbors=num_neighbors, gamma=gamma
         )
-        self.edge_conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
         self.mlp = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, node_ids, edge_index, A, edge_times):
@@ -406,11 +418,12 @@ class ASH_DGT(nn.Module):
         x_cat = torch.cat([x, pos_enc, temp_enc], dim=1)  # [n, in_dim+pos_dim+time_dim]
         h = self.input_proj(x_cat)  # [n, hidden_dim]
 
-        # Transformer encoding over all nodes.
-        # h_seq = h.unsqueeze(0)  # [1, n, hidden_dim]
-        # h_trans = self.transformer_encoder(h_seq)
-        # h = h_trans.squeeze(0)  # [n, hidden_dim]
-        h = self.gcn(h, edge_index)
+        if self.backbone == 'Transformer':
+            h_seq = h.unsqueeze(0)  # [1, n, hidden_dim]
+            h_trans = self.encoder(h_seq)
+            h = h_trans.squeeze(0)  # [n, hidden_dim]
+        else:
+            h = self.encoder(h, edge_index)
         # Precompute aggregated super and global features.
         if self.num_super_nodes > 0:
             X_coarse, A_coarse, _ = graph_coarsening(
@@ -478,8 +491,12 @@ class ASH_DGT(nn.Module):
         for i in range(0, E_total, chunk_size):
             chunk_u = sampled_neighbors_u[i : i + chunk_size, :, :]
             chunk_v = sampled_neighbors_v[i : i + chunk_size, :, :]
-            agg_u = self.edge_conv(chunk_u.transpose(1, 2)).transpose(1, 2)
-            agg_v = self.edge_conv(chunk_v.transpose(1, 2)).transpose(1, 2)
+            if self.backbone == 'Transformer':
+                agg_u = self.edge_conv(chunk_u, chunk_u, chunk_u)
+                agg_v = self.edge_conv(chunk_v, chunk_v, chunk_v)
+            else:
+                agg_u = self.edge_conv(chunk_u.transpose(1, 2)).transpose(1, 2)
+                agg_v = self.edge_conv(chunk_v.transpose(1, 2)).transpose(1, 2)
             agg_u = chunk_u.mean(dim=1)
             agg_v = chunk_v.mean(dim=1)
             agg_u_list.append(agg_u)

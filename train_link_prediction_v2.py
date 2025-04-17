@@ -118,6 +118,7 @@ def train_link_prediction(args):
     # Instantiate the model.
     model = ASH_DGT(
         num_nodes=num_nodes,
+        backbone=args.backbone,
         in_dim=args.in_dim,
         hidden_dim=args.hidden_dim,
         num_classes=args.embedding_dim,  # output embedding dimension
@@ -254,6 +255,9 @@ def main():
         type=str,
         required=True,
         help="Dataset name (e.g., mooc, reddit, wiki, uci, socialevo, enron)",
+    )
+    parser.add_argument(
+        "--backbone", type=str, default='GCN', help="Backbone Model"
     )
     parser.add_argument(
         "--in_dim", type=int, default=16, help="Input feature dimension"
