@@ -1,6 +1,4 @@
-# ASH-DGT Dynamic Graph Learning
-
-This repo implements the ASH-DGT model for dynamic graph learning tasks, including node classification and link prediction.
+# ASH Dynamic Graph Learning
 
 ## Requirements
 
